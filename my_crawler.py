@@ -20,7 +20,9 @@ p_links = re.compile(r'''<a [^>]*href=(["'])(.*?)\1''')
 p_root = re.compile(r'(?:https?:)?//[^/]*')
 # Находит текущую директорию для корректной сборки ссылки
 p_current = re.compile(r'(.*/)')
+# Проверяет, содержит ли ссылка абсолютный путь
 p_abs = re.compile(r'https?://')
+# Используется для корректной сборки ссылок с кириллическими доменами
 p_cyrillic = re.compile(r'((?:https?)?://)(%[^/]*)(.*)')
 
 def get_html(url):
@@ -38,6 +40,7 @@ def get_title(html):
     else:
         return 'No title found'
 
+# Метод собирает корректные ссылки (по крайней мере пытается) из исходного URL и содержимого 'href' 
 def get_links(html, url):    
     m_root = p_root.match(url)
     root = m_root.group(0)   
@@ -62,42 +65,63 @@ def get_links(html, url):
         links.add(link)        
     return links
 
+# Получает данные для одной страницы
 def process(url):
     html = get_html(url)
     if html:
         title = get_title(html)
         links = get_links(html, url) 
-        return title, links, url#, html
+        return title, links, url, html
     else:
-        return "BAD URL", set(), url
+        return "BAD URL", set(), url, html
 
+# Многопоточный обход ссылок глубины 2
 def load(main_url):
     second_links = set()
     with ThreadPoolExecutor(max_workers=5) as pool:
+        # processed_urls - словарь, ключами которого являются обработанные URL, 
+        # а значениями - кортеж (title, links, html)
+        # Сначала добавляем туда только исходную ссылку и данные для неё
         processed_urls = {main_url : process(main_url)}
-        links = processed_urls[main_url][1]        
-        results = [pool.submit(process, url) for url in links]        
+        # Собираем все ссылки с главной страницы для дальнейшей обработки
+        links = processed_urls[main_url][1]
+        # Создаём список задач на обработку (глубина 1)
+        results = [pool.submit(process, url) for url in links]
+        # По мере накопления результатов добавляем их в processed_urls
         for future in as_completed(results):
-            title, links, url = future.result()
-            processed_urls.update({url : (title, links)})
-            second_links.update(links - processed_urls.keys())        
+            title, links, url, html = future.result()
+            processed_urls.update({url : (title, links, html)})
+            # Собираем множество вторичных ссылок для следующего этапа обработки (глубина 2)
+            second_links.update(links - processed_urls.keys())
+        # Далее аналогично повторяем обработку
         results = [pool.submit(process, url) for url in second_links]       
         for future in as_completed(results):
-            title, links, url = future.result()
-            processed_urls.update({url : (title, links)})                        
+            title, links, url, html = future.result()
+            processed_urls.update({url : (title, links, html)})                        
     return processed_urls
 
+# Сохранение полученных данных
 def save_results(processed_urls):
     storage = ZODB.FileStorage.FileStorage('data.fs')
     db = ZODB.DB(storage)
     connection = db.open()
     root = connection.root
-
+    # В этот словарь сложим данные, которые в последствии нужно будет
+    # возвращать: URL, title и ссылки
+    useful = {}
+    # В этот сложим html, который нужно только хранить
+    htmls = {}
+    for url, data in processed_urls.items():
+        useful[url] = data[:-1]
+        htmls[url] = data[-1]
     root.urls = BTrees.OOBTree.BTree()
-    root.urls.update(processed_urls)
+    root.urls.update(useful)
+    root.htmls = BTrees.OOBTree.BTree()
+    root.htmls.update(htmls)
     transaction.commit()
     db.close()
     
+# Метод, выводящий на печать информацию для запрашиваемого количества ссылок
 def get_N_urls(main_url, N):
     try:
         storage = ZODB.FileStorage.FileStorage('data.fs')
@@ -105,11 +129,20 @@ def get_N_urls(main_url, N):
         connection = db.open()
         root = connection.root
     except:
+        # Невозможно получить данные, предварительно не скачав их
+        db.close()
         print("Cannot 'get' before 'load'")
+        return
     if main_url in root.urls:
         l = list(root.urls[main_url][1])
     else:
+        # Когда запрашиваемой ссылки нет в базе. Это значит, что ссылка 
+        # принадлежит к третьему уровню вложенности (не обрабатывалась)
+        # или такой ссылки вообще не было в загруженных данных
+        l = []
+        db.close()
         print("No such URL in the DB")
+        return
     if N > len(l):
         N = len(l)
     for i in range(N):
@@ -117,6 +150,7 @@ def get_N_urls(main_url, N):
         try:
             title = root.urls[url][0]
         except:
+            # Ссылка третьего уровня - для неё нет данных кроме самого URL
             title = "Not found in DB"
         print(url + ': "' + title + '"')
     db.close()
